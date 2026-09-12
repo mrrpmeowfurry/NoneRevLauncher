@@ -1,0 +1,36 @@
+#include <windows.h>
+#include "resource.h"
+
+// icon + the bitmaps for the 2016 style install window
+// (button bitmaps are the ones from the real bootstrapper in Installer\Bootstrapper\assets)
+IDI_APP             ICON    "assets\\app.ico"
+IDB_LOGO            BITMAP  "assets\\logo.bmp"
+IDB_BTN_CANCEL      BITMAP  "assets\\btn_cancel.bmp"
+IDB_BTN_CANCEL_ON   BITMAP  "assets\\btn_cancel-ON.bmp"
+IDB_BTN_OK          BITMAP  "assets\\btn_ok.bmp"
+IDB_BTN_OK_ON       BITMAP  "assets\\btn_ok-ON.bmp"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "NoneRev"
+            VALUE "FileDescription", "NoneRev Launcher"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "NoneRevLauncher"
+            VALUE "OriginalFilename", "NoneRevLauncher.exe"
+            VALUE "ProductName", "NoneRev"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
