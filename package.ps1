@@ -8,6 +8,7 @@ param(
     [switch]$NoAndroid,
     [string]$LinuxTar = "",
     [switch]$NoLinux,
+    [switch]$NoStudio,
     [switch]$NoUpload,
     [string]$R2AccountId = "",
     [string]$R2AccessKey = "",
@@ -17,6 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $client = Join-Path $BuildRoot "WindowsClient\Win32\Release"
+$studio = Join-Path $BuildRoot "RobloxStudio\bin\Release"
 $content = Join-Path $BuildRoot "content"
 $launcher = Join-Path $BuildRoot "NoneRevLauncher\Win32\Release\NoneRevLauncher.exe"
 $setup = Join-Path $SiteRoot "uploads\setup"
@@ -143,6 +145,23 @@ function Send-ToR2([hashtable]$cred, [string]$bucket, [string]$key, [string]$fil
     } finally { $in.Dispose() }
 }
 
+# content, PlatformContent and shaders, laid out next to the exe (client and studio both)
+function Copy-GameData([string]$dest) {
+    robocopy $content (Join-Path $dest "content") /E /XF *.rbxl *.rbxlx /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying content" }
+
+    $platform = Join-Path $BuildRoot "PlatformContent\pc"
+    if (-not (Test-Path $platform)) { throw "no PlatformContent\pc in $BuildRoot" }
+    robocopy $platform (Join-Path $dest "PlatformContent\pc") /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying PlatformContent" }
+
+    $shaders = Join-Path $BuildRoot "shaders"
+    if (-not (Test-Path (Join-Path $shaders "shaders.json"))) { throw "no shaders\shaders.json in $BuildRoot" }
+    New-Item -ItemType Directory -Force (Join-Path $dest "shaders") | Out-Null
+    Copy-Item (Join-Path $shaders "shaders.json") (Join-Path $dest "shaders")
+    Copy-Item (Join-Path $shaders "shaders_*.pack") (Join-Path $dest "shaders")
+}
+
 New-Item -ItemType Directory -Force $setup | Out-Null
 New-Item -ItemType Directory -Force $stage | Out-Null
 
@@ -153,22 +172,9 @@ foreach ($f in $files) {
 }
 if (Test-Path (Join-Path $client "ClientSettings")) { Copy-Item (Join-Path $client "ClientSettings") (Join-Path $stage "ClientSettings") -Recurse }
 
-$contentDest = Join-Path $stage "content"
-robocopy $content $contentDest /E /XF *.rbxl *.rbxlx /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying content" }
+Copy-GameData $stage
 
-$platform = Join-Path $BuildRoot "PlatformContent\pc"
-if (-not (Test-Path $platform)) { throw "no PlatformContent\pc in $BuildRoot" }
-robocopy $platform (Join-Path $stage "PlatformContent\pc") /E /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying PlatformContent" }
-
-$shaders = Join-Path $BuildRoot "shaders"
-if (-not (Test-Path (Join-Path $shaders "shaders.json"))) { throw "no shaders\shaders.json in $BuildRoot" }
-New-Item -ItemType Directory -Force (Join-Path $stage "shaders") | Out-Null
-Copy-Item (Join-Path $shaders "shaders.json") (Join-Path $stage "shaders")
-Copy-Item (Join-Path $shaders "shaders_*.pack") (Join-Path $stage "shaders")
-
-$zip = Join-Path $setup ("$Version-NoneRevPlayer.zip")
+$zip =Join-Path $setup ("$Version-NoneRevPlayer.zip")
 if (Test-Path $zip) { Remove-Item $zip }
 Write-Host "zipping to $zip (this takes a bit)..."
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -222,6 +228,38 @@ if (-not $NoLinux) {
     }
 }
 
+$studioDir = Join-Path $setup "studio"
+$studioZip = $null
+$studioSize = 0
+if (-not $NoStudio) {
+    $studioExe = Join-Path $studio "RobloxStudioBeta.exe"
+    if (Test-Path $studioExe) {
+        if ((Get-Item $studioExe).LastWriteTime -lt (Get-Item (Join-Path $client "RobloxPlayerBeta.exe")).LastWriteTime.AddHours(-1)) {
+            Write-Warning "$studioExe is older than the client build, rebuild RobloxStudio if the code changed"
+        }
+        $studioStage = Join-Path $env:TEMP ("nonerev-studio-" + [guid]::NewGuid().ToString("n"))
+        robocopy $studio $studioStage /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb AppSettings.xml /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying studio" }
+        Copy-GameData $studioStage
+        # the repo's AppSettings.xml points at ..\..\..\content, in the zip content sits next to the exe
+        $settings = (Get-Content -Raw (Join-Path $BuildRoot "RobloxStudio\AppSettings.xml")) -replace '<ContentFolder>[^<]*</ContentFolder>', '<ContentFolder>content</ContentFolder>'
+        [IO.File]::WriteAllText((Join-Path $studioStage "AppSettings.xml"), $settings)
+
+        New-Item -ItemType Directory -Force $studioDir | Out-Null
+        $studioZip = Join-Path $studioDir "$Version-NoneRevStudio.zip"
+        if (Test-Path $studioZip) { Remove-Item $studioZip }
+        Write-Host "zipping studio to $studioZip..."
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($studioStage, $studioZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        Remove-Item $studioStage -Recurse -Force
+        Copy-Item $studioZip (Join-Path $studioDir "NoneRevStudio.zip") -Force
+        [IO.File]::WriteAllText((Join-Path $studioDir "version.txt"), $Version)
+        $studioSize = [math]::Round((Get-Item $studioZip).Length / 1MB, 1)
+        Write-Host "studio: $studioZip ($studioSize MB)"
+    } else {
+        Write-Warning "no RobloxStudioBeta.exe in $studio, studio left out. Build RobloxStudio in Release or pass -NoStudio"
+    }
+}
+
 $uploaded = $false
 if ($NoUpload) {
     Write-Host "-NoUpload given, not touching R2."
@@ -244,6 +282,11 @@ if ($NoUpload) {
             $uploads += @{ Key = "setup/linux/$Version-NoneRevPlayer-linux-x86_64.tar.gz"; File = $linuxVersioned }
             $uploads += @{ Key = "setup/linux/NoneRevPlayer-linux-x86_64.tar.gz";         File = (Join-Path $linux "NoneRevPlayer-linux-x86_64.tar.gz") }
             $uploads += @{ Key = "setup/linux/version.txt";                               File = (Join-Path $linux "version.txt") }
+        }
+        if ($studioZip) {
+            $uploads += @{ Key = "setup/studio/$Version-NoneRevStudio.zip"; File = $studioZip }
+            $uploads += @{ Key = "setup/studio/NoneRevStudio.zip";         File = (Join-Path $studioDir "NoneRevStudio.zip") }
+            $uploads += @{ Key = "setup/studio/version.txt";               File = (Join-Path $studioDir "version.txt") }
         }
         # version.txt last so nobody sees the version before the zip
         $uploads += @{ Key = "setup/version.txt"; File = (Join-Path $setup "version.txt") }
@@ -278,6 +321,7 @@ if (-not [string]::IsNullOrWhiteSpace($hook)) {
         )
         if ($apkVersioned) { $fields += @{ name = "Android"; value = "``$(Split-Path -Leaf $apkVersioned)`` ($apkSize MB)"; inline = $true } }
         if ($linuxVersioned) { $fields += @{ name = "Linux"; value = "``$(Split-Path -Leaf $linuxVersioned)`` ($linuxSize MB)"; inline = $true } }
+        if ($studioZip) { $fields += @{ name = "Studio"; value = "``$(Split-Path -Leaf $studioZip)`` ($studioSize MB)"; inline = $true } }
         $where = "local only"
         if ($uploaded) { $where = "r2://$R2Bucket/setup" }
         $fields += @{ name = "Uploaded to"; value = $where; inline = $true }
