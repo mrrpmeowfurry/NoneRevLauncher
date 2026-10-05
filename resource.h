@@ -1,4 +1,3 @@
-// resource ids for NoneRevLauncher.rc
 #define IDI_APP             100
 #define IDB_LOGO            101
 #define IDB_BTN_CANCEL      102

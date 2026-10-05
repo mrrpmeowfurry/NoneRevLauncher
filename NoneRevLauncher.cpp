@@ -8,12 +8,10 @@
 //    if that version is not installed it will downoad and unzip at %LOCALAPPDATA%\NoneRev\Versions\<version>\
 //    then start RobloxPlayerBeta.exe with the ticket
 //  - run with no args will install/update and then open the site, while "--uninstall" will remove everything
-//
-// the site url comes from the placelauncherurl (scheme + host), so the same exe works for
-// localhost and for prod. NONEREV_DEFAULT_BASE_URL (set in the vcxproj) is only used when
-// there is no url to take it from (plain double click).
-//
-// deps: just win32 + wininet + miniz.c for the zip
+//  - also registers "discord-<app id>:" so Discord's Join button can start us: we then ask Discord which
+//    server the friend is in and open the game page on the site, which presses Play on that server
+//  - studio: "nonerev-launcher:1+launchmode:edit+gameinfo:<ticket>+script:<edit.ashx url>" or "--studio"
+//    installs the newest studio zip to %LOCALAPPDATA%\NoneRev\Studio\<version>\ and opens RobloxStudioBeta.exe
 
 #define _WIN32_WINNT 0x0601
 #define WIN32_LEAN_AND_MEAN
@@ -38,6 +36,8 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -49,13 +49,17 @@
 #define NONEREV_DEFAULT_BASE_URL "http://localhost"
 #endif
 
+#ifndef NONEREV_DISCORD_APP_ID
+#define NONEREV_DISCORD_APP_ID ""
+#endif
+
 static const wchar_t* kProtocol = L"nonerev-launcher";
 static const wchar_t* kAppName = L"NoneRev";
 static const wchar_t* kLauncherExe = L"NoneRevLauncher.exe";
 static const wchar_t* kPlayerExe = L"RobloxPlayerBeta.exe";
+static const wchar_t* kStudioExe = L"RobloxStudioBeta.exe";
 static const wchar_t* kRegKey = L"Software\\NoneRev\\Launcher";
 
-// string helper
 static std::wstring toW(const std::string& s)
 {
     if (s.empty()) return L"";
@@ -100,7 +104,6 @@ static std::string urlDecode(const std::string& s)
     return out;
 }
 
-// "http://host:port/whatever" > "http://host:port"
 static std::string baseOf(const std::string& url)
 {
     size_t p = url.find("://");
@@ -109,13 +112,12 @@ static std::string baseOf(const std::string& url)
     return q == std::string::npos ? url : url.substr(0, q);
 }
 
-// nonerev-launcher:1+launchmode:play+gameinfo:abc+placelauncherurl:http%3A%2F%2F...
 static std::map<std::string, std::string> parseProtocolArgs(const std::string& arg)
 {
     std::map<std::string, std::string> m;
     std::string s = arg;
     size_t colon = s.find(':');
-    if (colon != std::string::npos) s = s.substr(colon + 1); // drop "nonerev-launcher:"
+    if (colon != std::string::npos) s = s.substr(colon + 1);
     size_t start = 0;
     while (start <= s.size())
     {
@@ -130,7 +132,6 @@ static std::map<std::string, std::string> parseProtocolArgs(const std::string& a
     return m;
 }
 
-// paths and registry
 static std::wstring installDir()
 {
     wchar_t path[MAX_PATH];
@@ -143,6 +144,14 @@ static std::wstring installDir()
 static std::wstring versionsDir()
 {
     std::wstring dir = installDir() + L"\\Versions";
+    CreateDirectoryW(dir.c_str(), NULL);
+    return dir;
+}
+
+// kept out of Versions, the client cleanup deletes everything in there but its own version
+static std::wstring studioDir()
+{
+    std::wstring dir = installDir() + L"\\Studio";
     CreateDirectoryW(dir.c_str(), NULL);
     return dir;
 }
@@ -162,7 +171,6 @@ static bool fileExists(const std::wstring& p)
 
 static void createDirs(const std::wstring& path)
 {
-    // mkdir -p
     for (size_t i = 3; i < path.size(); ++i)
     {
         if (path[i] == L'\\' || path[i] == L'/')
@@ -173,7 +181,6 @@ static void createDirs(const std::wstring& path)
 
 static void deleteTree(const std::wstring& dir)
 {
-    // SHFileOperation wants a double null terminated string
     std::vector<wchar_t> buf(dir.begin(), dir.end());
     buf.push_back(0);
     buf.push_back(0);
@@ -209,7 +216,6 @@ static std::wstring regGet(const std::wstring& key, const wchar_t* name)
     return out;
 }
 
-// install window
 static const int kWinW = 500;
 static const int kWinH = 320;
 static const int kButtonW = 130;
@@ -241,7 +247,6 @@ static void setProgress(int percent)
     SendMessage(g_bar, PBM_SETPOS, percent < 0 ? 0 : (percent > 100 ? 100 : percent), 0);
 }
 
-// the sliding bar while we wait on the site (version check)
 static void setMarquee()
 {
     if (!g_bar) return;
@@ -258,7 +263,6 @@ static void showCancel(bool show)
     if (g_button && !g_buttonIsOk) ShowWindow(g_button, show ? SW_SHOW : SW_HIDE);
 }
 
-// "NONEREV IS SUCCESSFULLY INSTALLED!"
 static void showSuccess(const std::wstring& title, const std::wstring& subtitle)
 {
     ShowWindow(g_label, SW_HIDE);
@@ -300,7 +304,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_NCHITTEST:
     {
         LRESULT hit = DefWindowProcW(h, msg, w, l);
-        return hit == HTCLIENT ? HTCAPTION : hit; // drag it anywhere
+        return hit == HTCLIENT ? HTCAPTION : hit;
     }
     case WM_CTLCOLORSTATIC:
         SetTextColor((HDC)w, RGB(25, 25, 25));
@@ -330,7 +334,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (LOWORD(w) == ID_BUTTON)
         {
             if (g_buttonIsOk) DestroyWindow(h);
-            else ExitProcess(0); // cancel
+            else ExitProcess(0);
         }
         break;
     case WM_LAUNCHER_DONE:
@@ -385,7 +389,6 @@ static void createWindow()
     g_wnd = CreateWindowExW(0, wc.lpszClassName, kAppName, WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
         x, y, kWinW, kWinH, NULL, NULL, inst, NULL);
 
-    // logo
     BITMAP bm = { 0 };
     GetObject(g_bmpLogo, sizeof(bm), &bm);
     g_logo = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_BITMAP,
@@ -414,7 +417,6 @@ static void createWindow()
     setMarquee();
 }
 
-// http
 static HINTERNET openInternet()
 {
     HINTERNET h = InternetOpenW(L"NoneRevLauncher/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
@@ -422,7 +424,6 @@ static HINTERNET openInternet()
     return h;
 }
 
-// downloads url into memory (small stuff like the version file)
 static std::string httpGetString(const std::string& url)
 {
     HINTERNET inet = openInternet();
@@ -447,7 +448,6 @@ static std::string httpGetString(const std::string& url)
     return out;
 }
 
-// downloads url to a file with progress
 static void httpDownload(const std::string& url, const std::wstring& dest, const std::wstring& what)
 {
     HINTERNET inet = openInternet();
@@ -485,7 +485,6 @@ static void httpDownload(const std::string& url, const std::wstring& dest, const
     if (total > 0 && done != total) throw std::runtime_error("Download was cut short, try again");
 }
 
-// zip
 static void unzip(const std::wstring& zipPath, const std::wstring& destDir)
 {
     mz_zip_archive zip;
@@ -532,7 +531,6 @@ static void unzip(const std::wstring& zipPath, const std::wstring& destDir)
     mz_zip_reader_end(&zip);
 }
 
-// install/update
 static void writeAppSettings(const std::wstring& versionDir, const std::string& baseUrl)
 {
     std::string xml =
@@ -542,12 +540,19 @@ static void writeAppSettings(const std::wstring& versionDir, const std::string& 
         "  <ContentFolder>content</ContentFolder>\r\n"
         "  <SilentCrashReport>0</SilentCrashReport>\r\n"
         "  <HideChatWindow>0</HideChatWindow>\r\n"
+        "  <DiscordAppId>" NONEREV_DISCORD_APP_ID "</DiscordAppId>\r\n"
         "</Settings>\r\n";
     HANDLE file = CreateFileW((versionDir + L"\\AppSettings.xml").c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Could not write AppSettings.xml");
     DWORD written = 0;
     WriteFile(file, xml.c_str(), (DWORD)xml.size(), &written, NULL);
     CloseHandle(file);
+}
+
+static std::wstring discordProtocol()
+{
+    std::string id = NONEREV_DISCORD_APP_ID;
+    return id.empty() ? L"" : L"discord-" + toW(id);
 }
 
 static void registerProtocol(const std::wstring& exe)
@@ -557,14 +562,27 @@ static void registerProtocol(const std::wstring& exe)
     regSet(key, L"URL Protocol", L"");
     regSet(key + L"\\DefaultIcon", NULL, L"\"" + exe + L"\",0");
     regSet(key + L"\\shell\\open\\command", NULL, L"\"" + exe + L"\" \"%1\"");
+
+    // Discord looks this one up when someone presses Join and the game is not running yet
+    std::wstring discord = discordProtocol();
+    if (!discord.empty())
+    {
+        std::wstring dkey = L"Software\\Classes\\" + discord;
+        regSet(dkey, NULL, L"URL:Run NoneRev from Discord");
+        regSet(dkey, L"URL Protocol", L"");
+        regSet(dkey + L"\\DefaultIcon", NULL, L"\"" + exe + L"\",0");
+        regSet(dkey + L"\\shell\\open\\command", NULL, L"\"" + exe + L"\" \"%1\"");
+    }
 }
 
 static void unregisterProtocol()
 {
     SHDeleteKeyW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\") + kProtocol).c_str());
+    std::wstring discord = discordProtocol();
+    if (!discord.empty())
+        SHDeleteKeyW(HKEY_CURRENT_USER, (L"Software\\Classes\\" + discord).c_str());
 }
 
-// shows up in settings > apps / add-remove programs, uninstall runs us with --uninstall
 static const wchar_t* kUninstallKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\NoneRev";
 
 static void registerUninstaller(const std::wstring& exe, const std::wstring& dir)
@@ -585,7 +603,6 @@ static void registerUninstaller(const std::wstring& exe, const std::wstring& dir
     }
 }
 
-// deletes the install folder (including this exe) once we exit, cmd waits a sec for us
 static void scheduleSelfDelete(const std::wstring& dir)
 {
     std::wstring cmd = L"cmd.exe /c ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"" + dir + L"\"";
@@ -600,96 +617,281 @@ static void scheduleSelfDelete(const std::wstring& dir)
     }
 }
 
-// copies this exe into the install dir (if its not already there) and registers the protocol
+static void createStudioShortcut(const std::wstring& launcher);
+
 static std::wstring installSelf()
 {
     std::wstring dir = installDir();
     std::wstring target = dir + L"\\" + kLauncherExe;
     std::wstring me = thisExe();
     if (_wcsicmp(me.c_str(), target.c_str()) != 0)
-        CopyFileW(me.c_str(), target.c_str(), FALSE); // fails harmlessly if the installed one is running
+        CopyFileW(me.c_str(), target.c_str(), FALSE);
     registerProtocol(target);
+    createStudioShortcut(target);
     registerUninstaller(target, dir);
     regSet(kRegKey, L"InstallDir", dir);
     return target;
 }
 
-// makes sure the newest client is installed, returns its folder
+static std::string fetchVersion(const std::string& url)
+{
+    std::string version = trim(httpGetString(url));
+    if (version.empty() || version.size() > 40) throw std::runtime_error("The site did not give a version: " + url);
+    for (size_t i = 0; i < version.size(); ++i)
+        if (!(isalnum((unsigned char)version[i]) || version[i] == '.' || version[i] == '-' || version[i] == '_'))
+            throw std::runtime_error("Weird version from the site: " + version);
+    return version;
+}
+
+// download + unzip into vdir unless that version is already there. true when it installed something
+static bool installVersion(const std::wstring& vdir, const std::string& version, const std::string& zipUrl,
+                           const std::wstring& zipName, const wchar_t* exe, const wchar_t* what)
+{
+    std::wstring marker = vdir + L"\\installed.txt";
+    if (fileExists(marker) && fileExists(vdir + L"\\" + exe))
+        return false;
+
+    std::wstring zip = installDir() + L"\\" + toW(version) + zipName;
+    showCancel(true);
+    setProgress(0);
+    httpDownload(zipUrl, zip, what);
+    showCancel(false);
+    setProgress(0);
+    deleteTree(vdir);
+    createDirs(vdir);
+    unzip(zip, vdir);
+    DeleteFileW(zip.c_str());
+    if (!fileExists(vdir + L"\\" + exe)) throw std::runtime_error("The zip did not contain " + toA(exe));
+    HANDLE done = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (done != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        WriteFile(done, version.c_str(), (DWORD)version.size(), &written, NULL);
+        CloseHandle(done);
+    }
+    return true;
+}
+
+static void removeOtherVersions(const std::wstring& root, const std::wstring& keep)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW((root + L"\\*").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        std::wstring name = fd.cFileName;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && name != L"." && name != L".." && name != keep)
+            deleteTree(root + L"\\" + name);
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+}
+
 static std::wstring ensureClient(const std::string& baseUrl)
 {
     setStatus(L"Getting the latest NoneRev...");
     setMarquee();
-    std::string version = trim(httpGetString(baseUrl + "/setup/version"));
-    if (version.empty() || version.size() > 40) throw std::runtime_error("The site did not give a client version");
-    for (size_t i = 0; i < version.size(); ++i)
-        if (!(isalnum((unsigned char)version[i]) || version[i] == '.' || version[i] == '-' || version[i] == '_'))
-            throw std::runtime_error("Weird client version from the site: " + version);
-
+    std::string version = fetchVersion(baseUrl + "/setup/version");
     std::wstring vdir = versionsDir() + L"\\" + toW(version);
-    // "installed.txt" is written only after a full unzip, so a half done install gets redone
-    // instead of launching a client with half its content missing
-
-    std::wstring marker = vdir + L"\\installed.txt";
-    if (!fileExists(marker) || !fileExists(vdir + L"\\" + kPlayerExe))
-    {
-        std::wstring zip = installDir() + L"\\" + toW(version) + L"-NoneRevPlayer.zip";
-        showCancel(true);
-        setProgress(0);
-        httpDownload(baseUrl + "/setup/" + version + "-NoneRevPlayer.zip", zip, L"Installing NoneRev...");
-        showCancel(false);
-        setProgress(0);
-        deleteTree(vdir);
-        createDirs(vdir);
-        unzip(zip, vdir);
-        DeleteFileW(zip.c_str());
-        if (!fileExists(vdir + L"\\" + kPlayerExe)) throw std::runtime_error("The client zip did not contain " + toA(kPlayerExe));
-        HANDLE done = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (done != INVALID_HANDLE_VALUE)
-        {
-            DWORD written = 0;
-            WriteFile(done, version.c_str(), (DWORD)version.size(), &written, NULL);
-            CloseHandle(done);
-        }
-
-        // throw away older versions
-        WIN32_FIND_DATAW fd;
-        HANDLE find = FindFirstFileW((versionsDir() + L"\\*").c_str(), &fd);
-        if (find != INVALID_HANDLE_VALUE)
-        {
-            do
-            {
-                std::wstring name = fd.cFileName;
-                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && name != L"." && name != L".." && name != toW(version))
-                    deleteTree(versionsDir() + L"\\" + name);
-            } while (FindNextFileW(find, &fd));
-            FindClose(find);
-        }
-    }
+    if (installVersion(vdir, version, baseUrl + "/setup/" + version + "-NoneRevPlayer.zip", L"-NoneRevPlayer.zip", kPlayerExe, L"Installing NoneRev..."))
+        removeOtherVersions(versionsDir(), toW(version));
     setStatus(L"Configuring NoneRev...");
     setProgress(100);
-    writeAppSettings(vdir, baseUrl); // rewritten every time so a changed site url sticks
+    writeAppSettings(vdir, baseUrl);
     regSet(kRegKey, L"Version", toW(version));
     regSet(kRegKey, L"BaseUrl", toW(baseUrl));
     return vdir;
+}
+
+static std::wstring ensureStudio(const std::string& baseUrl)
+{
+    setStatus(L"Getting the latest NoneRev Studio...");
+    setMarquee();
+    std::string version = fetchVersion(baseUrl + "/setup/version?os=studio");
+    std::wstring vdir = studioDir() + L"\\" + toW(version);
+    // the site only links the newest studio zip, which is the version we just got
+    if (installVersion(vdir, version, baseUrl + "/setup/download?os=studio", L"-NoneRevStudio.zip", kStudioExe, L"Installing NoneRev Studio..."))
+        removeOtherVersions(studioDir(), toW(version));
+    setStatus(L"Configuring NoneRev Studio...");
+    setProgress(100);
+    writeAppSettings(vdir, baseUrl);
+    return vdir;
+}
+
+static void startProcess(const std::wstring& vdir, const wchar_t* exeName, const std::wstring& args)
+{
+    std::wstring exe = vdir + L"\\" + exeName;
+    std::wstring cmd = L"\"" + exe + L"\" " + args;
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(0);
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    if (!CreateProcessW(exe.c_str(), &buf[0], NULL, NULL, FALSE, 0, NULL, vdir.c_str(), &si, &pi))
+        throw std::runtime_error("Could not start " + toA(exeName));
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
 }
 
 static void launchPlayer(const std::wstring& vdir, const std::string& baseUrl, const std::string& ticket, const std::string& placeLauncherUrl)
 {
     setStatus(L"Starting NoneRev...");
     setProgress(100);
-    std::wstring exe = vdir + L"\\" + kPlayerExe;
-    std::wstring cmd = L"\"" + exe + L"\" --play -a \"" + toW(baseUrl) + L"/Login/Negotiate.ashx\" -t \"" + toW(ticket) + L"\" -j \"" + toW(placeLauncherUrl) + L"\"";
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    if (!CreateProcessW(exe.c_str(), &buf[0], NULL, NULL, FALSE, 0, NULL, vdir.c_str(), &si, &pi))
-        throw std::runtime_error("Could not start " + toA(kPlayerExe));
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    startProcess(vdir, kPlayerExe, L"--play -a \"" + toW(baseUrl) + L"/Login/Negotiate.ashx\" -t \"" + toW(ticket) + L"\" -j \"" + toW(placeLauncherUrl) + L"\"");
 }
 
-// main
+// same arguments the old roblox studio bootstrapper passed: -ide|-build, -url + -ticket to log in, -script to open a place
+static void launchStudio(const std::wstring& vdir, const std::string& baseUrl, const std::string& mode, const std::string& ticket, const std::string& script)
+{
+    setStatus(L"Starting NoneRev Studio...");
+    setProgress(100);
+    std::wstring args = mode == "build" ? L"-build" : L"-ide";
+    if (!ticket.empty())
+        args += L" -url \"" + toW(baseUrl) + L"/Login/Negotiate.ashx\" -ticket \"" + toW(ticket) + L"\"";
+    if (!script.empty())
+        args += L" -script \"" + toW(script) + L"\"";
+    startProcess(vdir, kStudioExe, args);
+}
+
+// Start menu entry that runs "NoneRevLauncher.exe --studio"
+static std::wstring studioShortcutPath()
+{
+    wchar_t path[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_PROGRAMS, NULL, 0, path))) return L"";
+    return std::wstring(path) + L"\\NoneRev Studio.lnk";
+}
+
+static void createStudioShortcut(const std::wstring& launcher)
+{
+    std::wstring lnk = studioShortcutPath();
+    if (lnk.empty()) return;
+    CoInitialize(NULL);
+    IShellLinkW* link = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&link)))
+    {
+        link->SetPath(launcher.c_str());
+        link->SetArguments(L"--studio");
+        link->SetIconLocation(launcher.c_str(), 0);
+        link->SetDescription(L"NoneRev Studio");
+        IPersistFile* file = NULL;
+        if (SUCCEEDED(link->QueryInterface(IID_IPersistFile, (void**)&file)))
+        {
+            file->Save(lnk.c_str(), TRUE);
+            file->Release();
+        }
+        link->Release();
+    }
+    CoUninitialize();
+}
+
+// ---- Discord "Join" -------------------------------------------------------------------------
+// Discord started us through the discord-<app id>: protocol because a friend's presence was
+// joined and the game was not running. The join secret is not on the command line: we have to
+// connect to Discord's local IPC pipe with the same app id, subscribe to ACTIVITY_JOIN, and
+// Discord then sends the pending join. The secret is "<placeId>:<jobId>" (DiscordPresence.cpp
+// in the client makes it), and the site's /games/start turns that into a Play on that server.
+
+static bool discordWrite(HANDLE pipe, unsigned opcode, const std::string& json)
+{
+    std::string frame(8, '\0');
+    unsigned length = (unsigned)json.size();
+    memcpy(&frame[0], &opcode, 4);
+    memcpy(&frame[4], &length, 4);
+    frame += json;
+    DWORD written = 0;
+    return WriteFile(pipe, frame.data(), (DWORD)frame.size(), &written, NULL) && written == frame.size();
+}
+
+static bool discordRead(HANDLE pipe, unsigned& opcode, std::string& json, DWORD timeoutMs)
+{
+    DWORD start = GetTickCount();
+    for (;;)
+    {
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) return false;
+        if (available >= 8)
+        {
+            unsigned char header[8];
+            DWORD read = 0;
+            if (!ReadFile(pipe, header, 8, &read, NULL) || read != 8) return false;
+            unsigned length;
+            memcpy(&opcode, header, 4);
+            memcpy(&length, header + 4, 4);
+            if (length > 65536) return false;
+            json.assign(length, '\0');
+            DWORD got = 0;
+            while (got < length)
+            {
+                if (!ReadFile(pipe, &json[got], length - got, &read, NULL)) return false;
+                got += read;
+            }
+            return true;
+        }
+        if (GetTickCount() - start >= timeoutMs) return false;
+        Sleep(20);
+    }
+}
+
+static std::string jsonString(const std::string& json, const char* key)
+{
+    std::string needle = std::string("\"") + key + "\":\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return "";
+    std::string out;
+    for (size_t i = pos + needle.size(); i < json.size() && json[i] != '"'; ++i)
+    {
+        if (json[i] == '\\' && i + 1 < json.size()) ++i;
+        out += json[i];
+    }
+    return out;
+}
+
+static void discordJoin(const std::string& baseUrl)
+{
+    setStatus(L"Asking Discord which game to join...");
+    setMarquee();
+
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    for (int i = 0; i < 10 && pipe == INVALID_HANDLE_VALUE; ++i)
+    {
+        char name[64];
+        sprintf(name, "\\\\.\\pipe\\discord-ipc-%d", i);
+        pipe = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    }
+    if (pipe == INVALID_HANDLE_VALUE) throw std::runtime_error("Discord does not seem to be running");
+
+    std::string secret;
+    unsigned opcode;
+    std::string json;
+    bool ok = discordWrite(pipe, 0, std::string("{\"v\":1,\"client_id\":\"") + NONEREV_DISCORD_APP_ID + "\"}")
+        && discordRead(pipe, opcode, json, 5000) && opcode == 1 && json.find("\"READY\"") != std::string::npos
+        && discordWrite(pipe, 1, "{\"cmd\":\"SUBSCRIBE\",\"evt\":\"ACTIVITY_JOIN\",\"args\":{},\"nonce\":\"join\"}");
+
+    // the join event arrives shortly after the subscription; everything else is answered or ignored
+    DWORD deadline = GetTickCount() + 15000;
+    while (ok && secret.empty() && GetTickCount() < deadline)
+    {
+        if (!discordRead(pipe, opcode, json, 1000)) continue;
+        if (opcode == 3) discordWrite(pipe, 4, json); // ping
+        else if (opcode == 2) break;                  // close
+        else if (opcode == 1 && json.find("\"ACTIVITY_JOIN\"") != std::string::npos) secret = jsonString(json, "secret");
+    }
+    CloseHandle(pipe);
+
+    if (!ok) throw std::runtime_error("Could not talk to Discord. Is the launcher's Discord app id right?");
+    if (secret.empty()) throw std::runtime_error("Discord did not say which game to join. Try the Join button again.");
+
+    size_t colon = secret.find(':');
+    std::string placeId = secret.substr(0, colon);
+    std::string jobId = colon == std::string::npos ? "" : secret.substr(colon + 1);
+    for (size_t i = 0; i < placeId.size(); ++i)
+        if (!isdigit((unsigned char)placeId[i])) throw std::runtime_error("Discord sent a join we do not understand");
+    for (size_t i = 0; i < jobId.size(); ++i)
+        if (!(isalnum((unsigned char)jobId[i]) || jobId[i] == '-' || jobId[i] == '_')) throw std::runtime_error("Discord sent a join we do not understand");
+
+    // the site knows who we are and presses Play on that server for us
+    std::string url = baseUrl + "/games/start?placeid=" + placeId + (jobId.empty() ? "" : "&jobId=" + jobId);
+    ShellExecuteW(NULL, L"open", toW(url).c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
 struct Job
 {
     std::string arg;
@@ -708,10 +910,32 @@ static DWORD WINAPI worker(LPVOID param)
             unregisterProtocol();
             SHDeleteKeyW(HKEY_CURRENT_USER, kUninstallKey);
             SHDeleteKeyW(HKEY_CURRENT_USER, L"Software\\NoneRev");
+            DeleteFileW(studioShortcutPath().c_str());
             deleteTree(versionsDir());
             scheduleSelfDelete(installDir());
             showSuccess(L"NONEREV WAS REMOVED", L"Thanks for playing. Press OK to finish.");
             stayOpen = true;
+        }
+        else if (arg == "--studio")
+        {
+            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
+            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
+            installSelf();
+            launchStudio(ensureStudio(baseUrl), baseUrl, "ide", "", "");
+        }
+        else if (arg.find("nonerev-launcher:") == 0 && (arg.find("launchmode:edit") != std::string::npos ||
+                 arg.find("launchmode:ide") != std::string::npos || arg.find("launchmode:build") != std::string::npos))
+        {
+            std::map<std::string, std::string> args = parseProtocolArgs(arg);
+            std::string script = args["script"];
+            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
+            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
+            // studio runs the -script lua with high permissions, so only from our own site
+            if (!script.empty() && _stricmp(baseOf(script).c_str(), baseUrl.c_str()) != 0)
+                throw std::runtime_error("The studio link points at another site: " + baseOf(script));
+            installSelf();
+            std::wstring vdir = ensureStudio(baseUrl);
+            launchStudio(vdir, baseUrl, args["launchmode"], args["gameinfo"], script);
         }
         else if (arg.find("nonerev-launcher:") == 0)
         {
@@ -726,11 +950,18 @@ static DWORD WINAPI worker(LPVOID param)
             std::wstring vdir = ensureClient(baseUrl);
             launchPlayer(vdir, baseUrl, ticket, placeLauncherUrl);
         }
+        else if (!discordProtocol().empty() && arg.find(toA(discordProtocol())) == 0)
+        {
+            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
+            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
+            installSelf();
+            ensureClient(baseUrl);
+            discordJoin(baseUrl);
+        }
         else
         {
-            // plain run: install/update, then open the site
-            std::string baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
-            if (baseUrl.empty()) baseUrl = NONEREV_DEFAULT_BASE_URL;
+            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
+            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
             installSelf();
             ensureClient(baseUrl);
             showSuccess(L"NONEREV IS SUCCESSFULLY INSTALLED!", L"Just click the \"Play\" button on any game to join the action!");

@@ -31,17 +31,20 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <OutDir>$(SolutionDir)$(ProjectName)\$(Platform)\$(Configuration)\</OutDir>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(Platform)\$(Configuration)\obj\</IntDir>
     <LinkIncremental Condition="'$(Configuration)'=='Debug'">true</LinkIncremental>
     <LinkIncremental Condition="'$(Configuration)'=='Release'">false</LinkIncremental>
   </PropertyGroup>
+  <PropertyGroup>
+    <NoneRevBaseUrl Condition="'$(NoneRevBaseUrl)'==''">https://nonerev.de</NoneRevBaseUrl>
+    <!-- Discord developer portal application id for Rich Presence; empty turns it off -->
+    <NoneRevDiscordAppId Condition="'$(NoneRevDiscordAppId)'==''">1555093279471575131</NoneRevDiscordAppId>
+  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <!-- change NONEREV_DEFAULT_BASE_URL to the real site before building the exe u give out;
-           it is only the fallback for a plain double click, a Play link always carries the site url -->
-      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;NONEREV_DEFAULT_BASE_URL="http://localhost";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;NONEREV_DEFAULT_BASE_URL="$(NoneRevBaseUrl)";NONEREV_DISCORD_APP_ID="$(NoneRevDiscordAppId)";%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
     </ClCompile>
     <Link>
@@ -63,7 +66,6 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <!-- static crt so the exe runs on a clean pc without the vc redist -->
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>

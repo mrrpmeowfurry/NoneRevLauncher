@@ -1,8 +1,6 @@
 #include <windows.h>
 #include "resource.h"
 
-// icon + the bitmaps for the 2016 style install window
-// (button bitmaps are the ones from the real bootstrapper in Installer\Bootstrapper\assets)
 IDI_APP             ICON    "assets\\app.ico"
 IDB_LOGO            BITMAP  "assets\\logo.bmp"
 IDB_BTN_CANCEL      BITMAP  "assets\\btn_cancel.bmp"
