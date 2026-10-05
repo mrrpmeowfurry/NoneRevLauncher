@@ -220,7 +220,25 @@ static const int kWinW = 500;
 static const int kWinH = 320;
 static const int kButtonW = 130;
 static const int kButtonH = 44;
-enum { ID_BUTTON = 1001, WM_LAUNCHER_DONE = WM_APP + 1 };
+enum
+{
+    ID_BUTTON = 1001,
+    WM_LAUNCHER_DONE = WM_APP + 1,
+    // the worker thread never touches the controls, it posts these to the window
+    WM_UI_STATUS,       // lParam: new std::wstring
+    WM_UI_PROGRESS,     // wParam: percent
+    WM_UI_MARQUEE,
+    WM_UI_CANCEL,       // wParam: show
+    WM_UI_SUCCESS       // lParam: new std::pair<std::wstring, std::wstring>
+};
+
+// set by the Cancel button / closing the window, the worker checks it between chunks
+static volatile LONG g_cancel = 0;
+struct Cancelled : std::runtime_error { Cancelled() : std::runtime_error("cancelled") {} };
+static void checkCancel()
+{
+    if (g_cancel) throw Cancelled();
+}
 
 static HWND g_wnd = NULL, g_logo = NULL, g_label = NULL, g_bar = NULL, g_button = NULL, g_title = NULL, g_subtitle = NULL;
 static HBITMAP g_bmpLogo = NULL, g_bmpCancel = NULL, g_bmpCancelOn = NULL, g_bmpOk = NULL, g_bmpOkOn = NULL;
@@ -230,12 +248,12 @@ static WNDPROC g_oldButtonProc = NULL;
 static bool g_buttonIsOk = false;
 static bool g_finished = false;
 
-static void setStatus(const std::wstring& text)
+static void uiSetStatus(const std::wstring& text)
 {
     if (g_label) SetWindowTextW(g_label, text.c_str());
 }
 
-static void setProgress(int percent)
+static void uiSetProgress(int percent)
 {
     if (!g_bar) return;
     LONG style = GetWindowLongW(g_bar, GWL_STYLE);
@@ -247,7 +265,7 @@ static void setProgress(int percent)
     SendMessage(g_bar, PBM_SETPOS, percent < 0 ? 0 : (percent > 100 ? 100 : percent), 0);
 }
 
-static void setMarquee()
+static void uiSetMarquee()
 {
     if (!g_bar) return;
     LONG style = GetWindowLongW(g_bar, GWL_STYLE);
@@ -258,12 +276,12 @@ static void setMarquee()
     }
 }
 
-static void showCancel(bool show)
+static void uiShowCancel(bool show)
 {
     if (g_button && !g_buttonIsOk) ShowWindow(g_button, show ? SW_SHOW : SW_HIDE);
 }
 
-static void showSuccess(const std::wstring& title, const std::wstring& subtitle)
+static void uiShowSuccess(const std::wstring& title, const std::wstring& subtitle)
 {
     ShowWindow(g_label, SW_HIDE);
     ShowWindow(g_bar, SW_HIDE);
@@ -275,6 +293,40 @@ static void showSuccess(const std::wstring& title, const std::wstring& subtitle)
     SendMessage(g_button, BM_SETIMAGE, (WPARAM)IMAGE_BITMAP, (LPARAM)g_bmpOk);
     ShowWindow(g_button, SW_SHOW);
     InvalidateRect(g_wnd, NULL, TRUE);
+}
+
+static void uiCancel()
+{
+    InterlockedExchange(&g_cancel, 1);
+    EnableWindow(g_button, FALSE);
+    uiSetStatus(L"Cancelling...");
+}
+
+static void setStatus(const std::wstring& text)
+{
+    std::wstring* s = new std::wstring(text);
+    if (!g_wnd || !PostMessage(g_wnd, WM_UI_STATUS, 0, (LPARAM)s)) delete s;
+}
+
+static void setProgress(int percent)
+{
+    if (g_wnd) PostMessage(g_wnd, WM_UI_PROGRESS, (WPARAM)percent, 0);
+}
+
+static void setMarquee()
+{
+    if (g_wnd) PostMessage(g_wnd, WM_UI_MARQUEE, 0, 0);
+}
+
+static void showCancel(bool show)
+{
+    if (g_wnd) PostMessage(g_wnd, WM_UI_CANCEL, show ? 1 : 0, 0);
+}
+
+static void showSuccess(const std::wstring& title, const std::wstring& subtitle)
+{
+    std::pair<std::wstring, std::wstring>* p = new std::pair<std::wstring, std::wstring>(title, subtitle);
+    if (!g_wnd || !PostMessage(g_wnd, WM_UI_SUCCESS, 0, (LPARAM)p)) delete p;
 }
 
 // button is bitmap so just swap it for the -ON one while the mouse is over it
@@ -334,15 +386,40 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (LOWORD(w) == ID_BUTTON)
         {
             if (g_buttonIsOk) DestroyWindow(h);
-            else ExitProcess(0);
+            else uiCancel();
         }
         break;
+    case WM_UI_STATUS:
+    {
+        std::wstring* s = (std::wstring*)l;
+        uiSetStatus(*s);
+        delete s;
+        return 0;
+    }
+    case WM_UI_PROGRESS:
+        uiSetProgress((int)w);
+        return 0;
+    case WM_UI_MARQUEE:
+        uiSetMarquee();
+        return 0;
+    case WM_UI_CANCEL:
+        uiShowCancel(w != 0);
+        return 0;
+    case WM_UI_SUCCESS:
+    {
+        std::pair<std::wstring, std::wstring>* p = (std::pair<std::wstring, std::wstring>*)l;
+        uiShowSuccess(p->first, p->second);
+        delete p;
+        return 0;
+    }
     case WM_LAUNCHER_DONE:
         DestroyWindow(h);
         return 0;
     case WM_CLOSE:
+        // the worker cleans up after itself and then closes us
         if (g_finished) DestroyWindow(h);
-        return 0; // DO NOT CLOSE MID INSTALL!!!
+        else uiCancel();
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -421,6 +498,10 @@ static HINTERNET openInternet()
 {
     HINTERNET h = InternetOpenW(L"NoneRevLauncher/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!h) throw std::runtime_error("InternetOpen failed");
+    // a stalled server should end in an error, not a window stuck forever
+    DWORD connectMs = 15000, receiveMs = 30000;
+    InternetSetOptionW(h, INTERNET_OPTION_CONNECT_TIMEOUT, &connectMs, sizeof(connectMs));
+    InternetSetOptionW(h, INTERNET_OPTION_RECEIVE_TIMEOUT, &receiveMs, sizeof(receiveMs));
     return h;
 }
 
@@ -471,38 +552,69 @@ static void httpDownload(const std::string& url, const std::wstring& dest, const
 
     std::vector<char> buf(256 * 1024);
     DWORD read = 0, done = 0, written = 0;
-    while (InternetReadFile(req, &buf[0], (DWORD)buf.size(), &read) && read > 0)
+    bool ok = true;
+    setStatus(what);
+    bool cancelled = false;
+    for (;;)
     {
-        WriteFile(file, &buf[0], read, &written, NULL);
+        if (g_cancel) { cancelled = true; break; }
+        if (!InternetReadFile(req, &buf[0], (DWORD)buf.size(), &read)) { ok = false; break; }
+        if (read == 0) break;
+        if (!WriteFile(file, &buf[0], read, &written, NULL) || written != read) { ok = false; break; }
         done += read;
         if (total > 0)
             setProgress((int)((unsigned long long)done * 100 / total));
-        setStatus(what);
     }
     CloseHandle(file);
     InternetCloseHandle(req);
     InternetCloseHandle(inet);
-    if (total > 0 && done != total) throw std::runtime_error("Download was cut short, try again");
+    if (cancelled || !ok || (total > 0 && done != total))
+    {
+        DeleteFileW(dest.c_str());
+        if (cancelled) throw Cancelled();
+        throw std::runtime_error("Download was cut short, try again");
+    }
+}
+
+static size_t writeToHandle(void* file, mz_uint64, const void* buf, size_t n)
+{
+    DWORD written = 0;
+    return WriteFile((HANDLE)file, buf, (DWORD)n, &written, NULL) ? written : 0;
 }
 
 static void unzip(const std::wstring& zipPath, const std::wstring& destDir)
 {
     mz_zip_archive zip;
     memset(&zip, 0, sizeof(zip));
-    // miniz wants a narrow path, so use the short 8.3 name non-ascii user folders still work
-    wchar_t shortPath[MAX_PATH];
-    GetShortPathNameW(zipPath.c_str(), shortPath, MAX_PATH);
-    if (!mz_zip_reader_init_file(&zip, toA(shortPath).c_str(), 0))
+    // open it ourselves so user folders with non-ascii names work (8.3 short names can be turned off)
+    FILE* f = NULL;
+    if (_wfopen_s(&f, zipPath.c_str(), L"rb") != 0 || !f) throw std::runtime_error("Could not open the downloaded zip");
+    _fseeki64(f, 0, SEEK_END);
+    mz_uint64 zipSize = (mz_uint64)_ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    if (!mz_zip_reader_init_cfile(&zip, f, zipSize, 0))
+    {
+        fclose(f);
         throw std::runtime_error("The downloaded file is not a valid zip");
+    }
+    // reader_end first, then the file it reads from
+    struct CloseZip
+    {
+        mz_zip_archive* zip; FILE* f;
+        ~CloseZip() { mz_zip_reader_end(zip); fclose(f); }
+    } closeZip = { &zip, f };
 
     mz_uint count = mz_zip_reader_get_num_files(&zip);
     for (mz_uint i = 0; i < count; ++i)
     {
+        checkCancel();
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         std::wstring rel = toW(st.m_filename);
         for (size_t k = 0; k < rel.size(); ++k) if (rel[k] == L'/') rel[k] = L'\\';
-        if (rel.find(L"..") != std::wstring::npos) continue; // no zip slip thx
+        // no zip slip: nothing that climbs out, is absolute or names a drive
+        if (rel.empty() || rel.find(L"..") != std::wstring::npos || rel[0] == L'\\' || rel.find(L':') != std::wstring::npos)
+            continue;
         std::wstring out = destDir + L"\\" + rel;
         // .net's ZipFile (package.ps1) write stuff without the dos dir attribute, so
         // miniz doesnt spot them, a trailing slash is a folder no matter what the attrs say
@@ -515,20 +627,16 @@ static void unzip(const std::wstring& zipPath, const std::wstring& destDir)
         size_t slash = out.find_last_of(L'\\');
         if (slash != std::wstring::npos) createDirs(out.substr(0, slash));
 
-        size_t size = 0;
-        void* data = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
-        if (!data) { mz_zip_reader_end(&zip); throw std::runtime_error("Could not extract " + std::string(st.m_filename)); }
         HANDLE file = CreateFileW(out.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (file == INVALID_HANDLE_VALUE) { mz_free(data); mz_zip_reader_end(&zip); throw std::runtime_error("Could not write " + std::string(st.m_filename)); }
-        DWORD written = 0;
-        WriteFile(file, data, (DWORD)size, &written, NULL);
+        if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Could not write " + std::string(st.m_filename));
+        // straight to disk, no copy of the whole file in memory
+        mz_bool extracted = mz_zip_reader_extract_to_callback(&zip, i, writeToHandle, file, 0);
         CloseHandle(file);
-        mz_free(data);
+        if (!extracted) throw std::runtime_error("Could not extract " + std::string(st.m_filename) + ", the disk may be full");
 
         if (i % 50 == 0)
             setProgress((int)(i * 100 / count));
     }
-    mz_zip_reader_end(&zip);
 }
 
 static void writeAppSettings(const std::wstring& versionDir, const std::string& baseUrl)
@@ -603,18 +711,39 @@ static void registerUninstaller(const std::wstring& exe, const std::wstring& dir
     }
 }
 
-static void scheduleSelfDelete(const std::wstring& dir)
+// our exe lives in the install folder, so a copy in %TEMP% waits for us to exit and then removes it
+static void scheduleSelfDelete()
 {
-    std::wstring cmd = L"cmd.exe /c ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"" + dir + L"\"";
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    std::wstring helper = std::wstring(tmp) + L"NoneRevUninstall.exe";
+    if (!CopyFileW(thisExe().c_str(), helper.c_str(), FALSE)) return;
+
+    wchar_t pid[16];
+    swprintf_s(pid, L"%lu", GetCurrentProcessId());
+    std::wstring cmd = L"\"" + helper + L"\" --remove-install " + pid;
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
     buf.push_back(0);
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
-    if (CreateProcessW(NULL, &buf[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    if (CreateProcessW(helper.c_str(), &buf[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
     {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
+}
+
+// the %TEMP% copy: wait until the launcher has really exited, then delete the install folder.
+// only ever installDir(), never a path from the command line
+static void finishUninstall(DWORD pid)
+{
+    HANDLE launcher = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (launcher)
+    {
+        WaitForSingleObject(launcher, 60000);
+        CloseHandle(launcher);
+    }
+    deleteTree(installDir());
 }
 
 static void createStudioShortcut(const std::wstring& launcher);
@@ -651,23 +780,39 @@ static bool installVersion(const std::wstring& vdir, const std::string& version,
     if (fileExists(marker) && fileExists(vdir + L"\\" + exe))
         return false;
 
+    // unzip next to it and rename when complete, so a crash or cancel never leaves a half install behind
     std::wstring zip = installDir() + L"\\" + toW(version) + zipName;
-    showCancel(true);
-    setProgress(0);
-    httpDownload(zipUrl, zip, what);
-    showCancel(false);
-    setProgress(0);
-    deleteTree(vdir);
-    createDirs(vdir);
-    unzip(zip, vdir);
-    DeleteFileW(zip.c_str());
-    if (!fileExists(vdir + L"\\" + exe)) throw std::runtime_error("The zip did not contain " + toA(exe));
-    HANDLE done = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (done != INVALID_HANDLE_VALUE)
+    std::wstring partial = vdir + L".partial";
+    try
     {
-        DWORD written = 0;
-        WriteFile(done, version.c_str(), (DWORD)version.size(), &written, NULL);
-        CloseHandle(done);
+        showCancel(true);
+        setProgress(0);
+        httpDownload(zipUrl, zip, what);
+        setProgress(0);
+        deleteTree(partial);
+        createDirs(partial);
+        unzip(zip, partial);
+        showCancel(false);
+        DeleteFileW(zip.c_str());
+        if (!fileExists(partial + L"\\" + exe)) throw std::runtime_error("The zip did not contain " + toA(exe));
+
+        HANDLE done = CreateFileW((partial + L"\\installed.txt").c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (done != INVALID_HANDLE_VALUE)
+        {
+            DWORD written = 0;
+            WriteFile(done, version.c_str(), (DWORD)version.size(), &written, NULL);
+            CloseHandle(done);
+        }
+        deleteTree(vdir);
+        if (!MoveFileW(partial.c_str(), vdir.c_str()))
+            throw std::runtime_error("Could not finish installing, close NoneRev and try again");
+    }
+    catch (...)
+    {
+        showCancel(false);
+        DeleteFileW(zip.c_str());
+        deleteTree(partial);
+        throw;
     }
     return true;
 }
@@ -853,7 +998,7 @@ static void discordJoin(const std::string& baseUrl)
     for (int i = 0; i < 10 && pipe == INVALID_HANDLE_VALUE; ++i)
     {
         char name[64];
-        sprintf(name, "\\\\.\\pipe\\discord-ipc-%d", i);
+        sprintf_s(name, "\\\\.\\pipe\\discord-ipc-%d", i);
         pipe = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     }
     if (pipe == INVALID_HANDLE_VALUE) throw std::runtime_error("Discord does not seem to be running");
@@ -897,13 +1042,41 @@ struct Job
     std::string arg;
 };
 
+// the site we download from and run things for. never taken from a link: any web page can open one
+static std::string siteUrl()
+{
+    std::string url = NONEREV_DEFAULT_BASE_URL;
+    if (url.empty()) url = toA(regGet(kRegKey, L"BaseUrl"));
+    return url;
+}
+
+static void requireOurSite(const std::string& url, const std::string& site)
+{
+    if (_stricmp(baseOf(url).c_str(), site.c_str()) != 0)
+        throw std::runtime_error("The link points at another site: " + baseOf(url));
+}
+
 static DWORD WINAPI worker(LPVOID param)
 {
     Job* job = (Job*)param;
     bool stayOpen = false;
+    std::string error;
+    // one launcher at a time, two of them unzipping into the same folder breaks the install
+    HANDLE lock = CreateMutexW(NULL, FALSE, L"Local\\NoneRevLauncherInstall");
+    if (lock && WaitForSingleObject(lock, 0) == WAIT_TIMEOUT)
+    {
+        setStatus(L"Waiting for the other NoneRev window...");
+        WaitForSingleObject(lock, INFINITE);
+    }
     try
     {
         std::string arg = job->arg;
+        std::string site = siteUrl();
+        std::map<std::string, std::string> args;
+        if (arg.find("nonerev-launcher:") == 0)
+            args = parseProtocolArgs(arg);
+        std::string mode = args["launchmode"];
+
         if (arg == "--uninstall")
         {
             setStatus(L"Removing NoneRev...");
@@ -912,67 +1085,65 @@ static DWORD WINAPI worker(LPVOID param)
             SHDeleteKeyW(HKEY_CURRENT_USER, L"Software\\NoneRev");
             DeleteFileW(studioShortcutPath().c_str());
             deleteTree(versionsDir());
-            scheduleSelfDelete(installDir());
+            scheduleSelfDelete();
             showSuccess(L"NONEREV WAS REMOVED", L"Thanks for playing. Press OK to finish.");
             stayOpen = true;
         }
         else if (arg == "--studio")
         {
-            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
-            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
             installSelf();
-            launchStudio(ensureStudio(baseUrl), baseUrl, "ide", "", "");
+            launchStudio(ensureStudio(site), site, "ide", "", "");
         }
-        else if (arg.find("nonerev-launcher:") == 0 && (arg.find("launchmode:edit") != std::string::npos ||
-                 arg.find("launchmode:ide") != std::string::npos || arg.find("launchmode:build") != std::string::npos))
+        else if (mode == "edit" || mode == "ide" || mode == "build")
         {
-            std::map<std::string, std::string> args = parseProtocolArgs(arg);
+            // studio runs the -script lua with high permissions
             std::string script = args["script"];
-            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
-            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
-            // studio runs the -script lua with high permissions, so only from our own site
-            if (!script.empty() && _stricmp(baseOf(script).c_str(), baseUrl.c_str()) != 0)
-                throw std::runtime_error("The studio link points at another site: " + baseOf(script));
+            if (!script.empty()) requireOurSite(script, site);
             installSelf();
-            std::wstring vdir = ensureStudio(baseUrl);
-            launchStudio(vdir, baseUrl, args["launchmode"], args["gameinfo"], script);
+            launchStudio(ensureStudio(site), site, mode, args["gameinfo"], script);
         }
         else if (arg.find("nonerev-launcher:") == 0)
         {
-            std::map<std::string, std::string> args = parseProtocolArgs(arg);
             std::string placeLauncherUrl = args["placelauncherurl"];
             std::string ticket = args["gameinfo"];
-            std::string baseUrl = baseOf(placeLauncherUrl);
-            if (baseUrl.empty()) throw std::runtime_error("The link has no placelauncherurl");
+            if (placeLauncherUrl.empty()) throw std::runtime_error("The link has no placelauncherurl");
             if (ticket.empty()) throw std::runtime_error("The link has no login ticket, log in on the site and press Play again");
+            requireOurSite(placeLauncherUrl, site);
 
             installSelf();
-            std::wstring vdir = ensureClient(baseUrl);
-            launchPlayer(vdir, baseUrl, ticket, placeLauncherUrl);
+            std::wstring vdir = ensureClient(site);
+            launchPlayer(vdir, site, ticket, placeLauncherUrl);
         }
         else if (!discordProtocol().empty() && arg.find(toA(discordProtocol())) == 0)
         {
-            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
-            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
             installSelf();
-            ensureClient(baseUrl);
-            discordJoin(baseUrl);
+            ensureClient(site);
+            discordJoin(site);
         }
         else
         {
-            std::string baseUrl = NONEREV_DEFAULT_BASE_URL;
-            if (baseUrl.empty()) baseUrl = toA(regGet(kRegKey, L"BaseUrl"));
             installSelf();
-            ensureClient(baseUrl);
+            ensureClient(site);
             showSuccess(L"NONEREV IS SUCCESSFULLY INSTALLED!", L"Just click the \"Play\" button on any game to join the action!");
-            ShellExecuteW(NULL, L"open", toW(baseUrl + "/games").c_str(), NULL, NULL, SW_SHOWNORMAL);
+            ShellExecuteW(NULL, L"open", toW(site + "/games").c_str(), NULL, NULL, SW_SHOWNORMAL);
             stayOpen = true;
         }
     }
+    catch (const Cancelled&)
+    {
+        stayOpen = false;
+    }
     catch (const std::exception& e)
     {
-        MessageBoxW(g_wnd, toW(e.what()).c_str(), kAppName, MB_OK | MB_ICONERROR);
+        error = e.what();
     }
+    if (lock)
+    {
+        ReleaseMutex(lock);
+        CloseHandle(lock);
+    }
+    if (!error.empty())
+        MessageBoxW(g_wnd, toW(error).c_str(), kAppName, MB_OK | MB_ICONERROR);
     g_finished = true;
     if (g_wnd && !stayOpen) PostMessage(g_wnd, WM_LAUNCHER_DONE, 0, 0);
     delete job;
@@ -983,6 +1154,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR cmdLine, int)
 {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argc > 2 && wcscmp(argv[1], L"--remove-install") == 0)
+    {
+        DWORD pid = wcstoul(argv[2], NULL, 10);
+        LocalFree(argv);
+        finishUninstall(pid);
+        return 0;
+    }
     Job* job = new Job();
     if (argc > 1) job->arg = toA(argv[1]);
     LocalFree(argv);
